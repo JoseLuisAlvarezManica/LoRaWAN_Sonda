@@ -55,5 +55,8 @@
 
 /* ── Intervalo de envío en segundos ─────────────────────────────────────────
  * Respetar el duty cycle y el FUP de la red.
- * Mínimo recomendado: 60 s.  Para pruebas usar 60 s como mínimo.             */
-#define LORAWAN_UPLINK_INTERVAL_S  3600
+ * Mínimo recomendado: 60 s.  Para pruebas usar 60 s como mínimo.             
+ * #define LORAWAN_UPLINK_INTERVAL_S  3600
+ * */
+
+#define LORAWAN_UPLINK_INTERVAL_S  1800

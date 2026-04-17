@@ -12,7 +12,7 @@
  *  1. Imprimir credenciales OTAA en consola.
  *  2. Inicializar radio SX1276 y configurar nodo LoRaWAN.
  *  3. Inicializar Modbus RTU master (UART1, RS485 half-duplex).
- *  4. Ejecutar Join OTAA con reintentos cada 30 s hasta conectar.
+ *  4. Ejecutar Join OTAA con reintentos cada 15 s hasta conectar.
  *  5. Cada LORAWAN_UPLINK_INTERVAL_S segundos:
  *       a. Leer 7 registros Modbus del sensor (slave addr=1, reg 0-6).
  *       b. Empaquetar en payload binario de 20 bytes.
@@ -138,33 +138,52 @@ static esp_err_t inicializar_modbus_master(void) {
 static void leer_sensor_modbus(void) {
     if (!master_handle) return;
 
-    /* Function Code 03 - Read Holding Registers, slave=1, inicio=0, qty=7 */
-    mb_param_request_t request = {
+    /* Lectura 1: Humedad, Temperatura, EC, pH  (reg 0x0000-0x0003) */
+    mb_param_request_t req1 = {
         .slave_addr = 1,
         .command    = 3,
-        .reg_start  = 0,
-        .reg_size   = 7
+        .reg_start  = 0x0000,
+        .reg_size   = 4
     };
-
-    uint16_t sensor_data[7] = {0};
-    esp_err_t err = mbc_master_send_request(master_handle, &request,
-                                            (void *)sensor_data);
-    if (err == ESP_OK) {
-        lastHum  = (float)sensor_data[0] / 10.0f;
-        lastTemp = (float)sensor_data[1] / 10.0f;
-        lastEc   = (float)sensor_data[2];          /* uS/cm, sin escalar */
-        lastPh   = (float)sensor_data[3] / 10.0f;
-        lastN    = (float)sensor_data[4];          /* mg/kg, sin escalar */
-        lastP    = (float)sensor_data[5];
-        lastK    = (float)sensor_data[6];
-        lastReadSuccess = true;
-        ESP_LOGI(TAG, "Modbus OK - T:%.1f C  H:%.1f%%  EC:%.0f uS/cm  pH:%.1f"
-                      "  N:%.0f  P:%.0f  K:%.0f mg/kg",
-                 lastTemp, lastHum, lastEc, lastPh, lastN, lastP, lastK);
-    } else {
+    uint16_t data1[4] = {0};
+    esp_err_t err1 = mbc_master_send_request(master_handle, &req1, (void *)data1);
+    if (err1 != ESP_OK) {
         lastReadSuccess = false;
-        ESP_LOGE(TAG, "Error leyendo Modbus: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error leyendo Modbus (T/H/EC/pH): %s", esp_err_to_name(err1));
+        return;
     }
+    lastHum  = (float)data1[0] / 10.0f;
+    lastTemp = (float)data1[1] / 10.0f;
+    lastEc   = (float)data1[2];
+    lastPh   = (float)data1[3] / 10.0f;
+
+    /* Pausa entre tramas: algunos sensores necesitan tiempo entre solicitudes */
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* Lectura 2: Nitrogeno, Fosforo, Potasio  (reg 0x0004-0x0006)
+     * Segun datasheet ZTS-3001: reg4=N, reg5=P, reg6=K (mg/kg, sin escalar)
+     * Se lee en trama separada para evitar truncamiento de respuesta de 7 registros */
+    mb_param_request_t req2 = {
+        .slave_addr = 1,
+        .command    = 3,
+        .reg_start  = 0x0004,
+        .reg_size   = 3
+    };
+    uint16_t data2[3] = {0};
+    esp_err_t err2 = mbc_master_send_request(master_handle, &req2, (void *)data2);
+    if (err2 != ESP_OK) {
+        lastReadSuccess = false;
+        ESP_LOGE(TAG, "Error leyendo Modbus (NPK): %s", esp_err_to_name(err2));
+        return;
+    }
+    lastN = (float)data2[0];  /* mg/kg */
+    lastP = (float)data2[1];
+    lastK = (float)data2[2];
+
+    lastReadSuccess = true;
+    ESP_LOGI(TAG, "Modbus OK - T:%.1f C  H:%.1f%%  EC:%.0f uS/cm  pH:%.1f"
+                  "  N:%.0f  P:%.0f  K:%.0f mg/kg",
+             lastTemp, lastHum, lastEc, lastPh, lastN, lastP, lastK);
 }
 
 /* -- Empaqueta los valores del sensor en 20 bytes big-endian (payload LoRaWAN)
@@ -287,14 +306,14 @@ void app_main(void) {
                  esp_err_to_name(mb_ret));
     }
 
-    /* Join OTAA con reintentos indefinidos cada 30 s */
+    /* Join OTAA con reintentos indefinidos cada 15 s */
     ESP_LOGI(TAG, "Iniciando Join OTAA...");
     int join_intentos = 0;
     while (lorawan_join_otaa() != LORA_OK) {
         join_intentos++;
-        ESP_LOGW(TAG, "Join fallo (intento %d). Reintentando en 30 s...",
+        ESP_LOGW(TAG, "Join fallo (intento %d). Reintentando en 15 s...",
                  join_intentos);
-        vTaskDelay(pdMS_TO_TICKS(30000));
+        vTaskDelay(pdMS_TO_TICKS(15000));
     }
     ESP_LOGI(TAG, "Conectado a la red LoRaWAN. Iniciando uplinks...");
 

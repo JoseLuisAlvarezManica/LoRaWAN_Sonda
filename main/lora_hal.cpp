@@ -16,6 +16,11 @@
 #include "RadioLib.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+
+#define LORA_NVS_NAMESPACE  "lora_hal"
+#define LORA_NVS_KEY_NONCES "nonces"
 
 static const char *TAG = "LORA_HAL";
 
@@ -239,6 +244,27 @@ int lorawan_begin(const uint8_t joinEUI[8], const uint8_t devEUI[8],
     }
 
     ESP_LOGI(TAG, "Nodo LoRaWAN OTAA configurado correctamente");
+
+    /* Restaurar bufferNonces desde NVS (preserva devNonce entre reinicios) */
+    {
+        nvs_handle_t h;
+        if (nvs_open(LORA_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+            uint8_t buf[RADIOLIB_LORAWAN_NONCES_BUF_SIZE];
+            size_t  len = sizeof(buf);
+            if (nvs_get_blob(h, LORA_NVS_KEY_NONCES, buf, &len) == ESP_OK &&
+                len == sizeof(buf)) {
+                int16_t rs = lwNode->setBufferNonces(buf);
+                if (rs == RADIOLIB_ERR_NONE) {
+                    ESP_LOGI(TAG, "bufferNonces restaurado desde NVS");
+                } else {
+                    ESP_LOGW(TAG, "setBufferNonces falló (%d) — se usará nonce fresco", rs);
+                    ESP_LOGW(TAG, "  -1113=NONCES_DISCARDED (keys/modo/región cambiados o NVS corrupto)");
+                }
+            }
+            nvs_close(h);
+        }
+    }
+
     return LORA_OK;
 }
 
@@ -255,6 +281,18 @@ int lorawan_join_otaa(void) {
 
     if (state == RADIOLIB_LORAWAN_NEW_SESSION) {
         ESP_LOGI(TAG, "Join OTAA exitoso — sesión nueva establecida");
+        /* Guardar bufferNonces en NVS para preservar devNonce */
+        {
+            nvs_handle_t h;
+            if (nvs_open(LORA_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_blob(h, LORA_NVS_KEY_NONCES,
+                             lwNode->getBufferNonces(),
+                             RADIOLIB_LORAWAN_NONCES_BUF_SIZE);
+                nvs_commit(h);
+                nvs_close(h);
+                ESP_LOGI(TAG, "bufferNonces guardado en NVS");
+            }
+        }
         goto join_ok;
     }
     if (state == RADIOLIB_LORAWAN_SESSION_RESTORED) {
@@ -263,6 +301,17 @@ int lorawan_join_otaa(void) {
     }
 
     ESP_LOGE(TAG, "Join OTAA falló: estado RadioLib = %d", state);
+    /* Guardar devNonce aunque el intento haya fallado: cada JoinRequest lo incrementa */
+    {
+        nvs_handle_t h;
+        if (nvs_open(LORA_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_blob(h, LORA_NVS_KEY_NONCES,
+                         lwNode->getBufferNonces(),
+                         RADIOLIB_LORAWAN_NONCES_BUF_SIZE);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
     if (state == -1116) {
         ESP_LOGE(TAG, "  → RADIOLIB_ERR_NO_JOIN_ACCEPT");
         ESP_LOGE(TAG, "  Causas comunes:");
