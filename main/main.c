@@ -237,15 +237,49 @@ static void tarea_lorawan(void *pvParameters) {
             continue;
         }
 
-        /* 3. Empaquetar y transmitir */
+        /* 3. Empaquetar y transmitir con hasta 3 intentos */
         empaquetar_sensores(payload);
 
-        int ret = lorawan_send_uplink(payload, 20, LORAWAN_APP_PORT);
-        if (ret == LORA_OK) {
-            ESP_LOGI(TAG, "Uplink #%lu enviado correctamente.", contador);
-        } else {
-            ESP_LOGE(TAG, "Error en uplink #%lu - reintentando en el proximo ciclo.",
+        int ret = LORA_ERR_INIT;
+        for (int intento = 1; intento <= 3; intento++) {
+            ret = lorawan_send_uplink(payload, 20, LORAWAN_APP_PORT);
+            if (ret == LORA_OK) {
+                ESP_LOGI(TAG, "Uplink #%lu enviado correctamente (intento %d).",
+                         contador, intento);
+                break;
+            }
+            ESP_LOGW(TAG, "Uplink #%lu fallo (intento %d/3).", contador, intento);
+            if (intento < 3) {
+                vTaskDelay(pdMS_TO_TICKS(15000)); /* esperar 15 s antes de reintentar */
+            }
+        }
+
+        /* 4. Si los 3 intentos fallaron, hacer re-join OTAA y reenviar */
+        if (ret != LORA_OK) {
+            ESP_LOGE(TAG, "Uplink #%lu fallo 3 veces. Iniciando re-join OTAA...",
                      contador);
+            int join_ret;
+            int join_intento = 0;
+            do {
+                join_intento++;
+                join_ret = lorawan_join_otaa();
+                if (join_ret == LORA_OK) {
+                    ESP_LOGI(TAG, "Re-join OTAA exitoso (intento %d).", join_intento);
+                } else {
+                    ESP_LOGW(TAG, "Re-join fallo (intento %d). Reintentando en 15 s...",
+                             join_intento);
+                    vTaskDelay(pdMS_TO_TICKS(15000));
+                }
+            } while (join_ret != LORA_OK);
+
+            /* Reenviar el uplink pendiente tras reconectarse */
+            ESP_LOGI(TAG, "Reenviando uplink #%lu tras reconexion...", contador);
+            ret = lorawan_send_uplink(payload, 20, LORAWAN_APP_PORT);
+            if (ret == LORA_OK) {
+                ESP_LOGI(TAG, "Uplink #%lu reenviado correctamente.", contador);
+            } else {
+                ESP_LOGE(TAG, "Uplink #%lu fallo incluso tras re-join.", contador);
+            }
         }
     }
 }
