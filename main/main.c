@@ -1,22 +1,29 @@
 ﻿/**
  * @file main.c
- * @brief Nodo LoRaWAN OTAA con lectura de sensor via Modbus RTU
+ * @brief Nodo LoRaWAN OTAA con lectura de sensor via Modbus RTU y deep sleep
  *
- * Lee datos reales de un sensor agricola de suelo via Modbus RTU (RS485)
- * y los transmite a una red LoRaWAN (Chirpstack) usando OTAA.
+ * Lee datos de un sensor agricola de suelo via Modbus RTU (RS485) y los
+ * transmite a una red LoRaWAN (Chirpstack) usando OTAA. Entre ciclos el
+ * dispositivo entra en deep sleep para minimizar el consumo de bateria.
  *
  * Al arrancar imprime en consola DevEUI, AppEUI y AppKey para registrar
  * el dispositivo en Chirpstack antes del primer join.
  *
- * Flujo de operacion:
+ * Flujo de operacion por ciclo (el deep sleep reinicia el chip cada vez):
  *  1. Imprimir credenciales OTAA en consola.
  *  2. Inicializar radio SX1276 y configurar nodo LoRaWAN.
  *  3. Inicializar Modbus RTU master (UART1, RS485 half-duplex).
  *  4. Ejecutar Join OTAA con reintentos cada 15 s hasta conectar.
- *  5. Cada LORAWAN_UPLINK_INTERVAL_S segundos:
- *       a. Leer 7 registros Modbus del sensor (slave addr=1, reg 0-6).
- *       b. Empaquetar en payload binario de 20 bytes.
- *       c. Enviar uplink LoRaWAN (FPort LORAWAN_APP_PORT).
+ *  5. Encender el sensor, leer 7 registros Modbus y apagarlo.
+ *  6. Empaquetar en payload binario de 20 bytes.
+ *  7. Enviar uplink LoRaWAN (FPort LORAWAN_APP_PORT).
+ *  8. Entrar en deep sleep por LORAWAN_UPLINK_INTERVAL_S segundos.
+ *     El timer RTC despierta el chip y el ciclo se repite desde el paso 1.
+ *
+ * Ahorro de energia:
+ *  - Deep sleep entre ciclos: ~10 uA (vs ~80-240 mA en activo).
+ *  - Sensor RS485 alimentado via transistor: apagado excepto durante la lectura.
+ *  - El contador de uplinks se almacena en RTC memory (sobrevive el deep sleep).
  *
  * Formato del payload (20 bytes, big-endian):
  *  [0:1]   temperatura   int16  valor x 100  (grados C)
@@ -40,12 +47,18 @@
  * Hardware: Heltec WiFi LoRa 32 V2 (SX1276)
  *   SPI: SCLK=5  MISO=19  MOSI=27  NSS=18  RST=14  DIO0=26
  * RS485: TX=17  RX=22  RE/DE=23  UART1  4800 baud  8N1
+ * SENSOR_PWR: GPIO 13 (control de transistor para alimentación del sensor)
+ *
+ * Deep Sleep (gpio_hold):
+ *  - Al arrancar: gpio_hold_dis(SENSOR_PWR_PIN) libera el hold del ciclo anterior
+ *  - Antes de dormir: gpio_hold_en(SENSOR_PWR_PIN) congela GPIO 13 en bajo
  */
 
 #include "lora_hal.h"
 #include "lorawan_credentials.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
+#include "esp_sleep.h"
 #include <math.h>
 
 #include "mbcontroller.h"
@@ -68,11 +81,32 @@ static const char *TAG = "LORAWAN_MODBUS";
 #define TX_PIN       17
 #define MB_PORT_NUM  UART_NUM_1
 
+/* -- Pin de control de alimentación del sensor (via transistor) ------------- */
+/* Conectar la base/gate del transistor a este pin (activo en alto).          */
+#define SENSOR_PWR_PIN   13
+#define SENSOR_WARMUP_MS 2000 /* Tiempo de estabilizacion tras encender (ms):
+                               * el sensor necesita ~1-2 s para inicializar su
+                               * MCU interna y estar listo para responder Modbus */
+
+/* -- Control de alimentación del sensor ------------------------------------- */
+static void sensor_power_set(bool on) {
+    gpio_set_level(SENSOR_PWR_PIN, on ? 1 : 0);
+    if (on) {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_WARMUP_MS));
+        ESP_LOGI(TAG, "Sensor encendido (warm-up %d ms).", SENSOR_WARMUP_MS);
+    } else {
+        ESP_LOGI(TAG, "Sensor apagado.");
+    }
+}
+
 /* -- Ultimos valores leidos del sensor -------------------------------------- */
 static float lastHum  = 0, lastTemp = 0, lastEc = 0, lastPh = 0;
 static float lastN    = 0, lastP    = 0, lastK  = 0;
 static bool  lastReadSuccess = false;
 static void *master_handle   = NULL;
+
+/* Contador de ciclos persistido en RTC memory: sobrevive el deep sleep */
+static RTC_DATA_ATTR uint32_t uplink_contador = 0;
 
 /* -- Escribe un int16 big-endian en dos bytes consecutivos del buffer ------- */
 static inline void put_be16(uint8_t *buf, int16_t val) {
@@ -215,71 +249,67 @@ static void empaquetar_sensores(uint8_t payload[20]) {
              payload[17], payload[18], payload[19]);
 }
 
-/* -- Tarea FreeRTOS: ciclo periodico de lectura Modbus + uplink LoRaWAN ----- */
-static void tarea_lorawan(void *pvParameters) {
-    uint32_t contador = 0;
-    uint8_t  payload[20];
+/* -- Ciclo unico de lectura Modbus + uplink LoRaWAN (llamado antes de deep sleep) */
+static void ejecutar_ciclo_uplink(void) {
+    uint8_t payload[20];
 
-    while (1) {
-        /* Esperar el intervalo configurado antes de cada uplink */
-        vTaskDelay(pdMS_TO_TICKS((uint32_t)LORAWAN_UPLINK_INTERVAL_S * 1000UL));
+    ESP_LOGI(TAG, "==== Uplink #%lu ====", uplink_contador);
 
-        contador++;
-        ESP_LOGI(TAG, "==== Uplink #%lu ====", contador);
+    /* 1. Encender sensor, leer y apagarlo para ahorrar energía */
+    sensor_power_set(true);
+    leer_sensor_modbus();
+    // vTaskDelay(pdMS_TO_TICKS(5000000));
+    sensor_power_set(false);
 
-        /* 1. Leer sensor */
-        leer_sensor_modbus();
+    /* 2. Omitir el uplink si la lectura Modbus fallo */
+    if (!lastReadSuccess) {
+        ESP_LOGW(TAG, "Lectura Modbus fallida - uplink omitido en ciclo #%lu.",
+                 uplink_contador);
+        return;
+    }
 
-        /* 2. Omitir el uplink si la lectura Modbus fallo */
-        if (!lastReadSuccess) {
-            ESP_LOGW(TAG, "Lectura Modbus fallida - uplink omitido en ciclo #%lu.",
-                     contador);
-            continue;
+    /* 3. Empaquetar y transmitir con hasta 3 intentos */
+    empaquetar_sensores(payload);
+
+    int ret = LORA_ERR_INIT;
+    for (int intento = 1; intento <= 3; intento++) {
+        ret = lorawan_send_uplink(payload, 20, LORAWAN_APP_PORT);
+        if (ret == LORA_OK) {
+            ESP_LOGI(TAG, "Uplink #%lu enviado correctamente (intento %d).",
+                     uplink_contador, intento);
+            break;
         }
-
-        /* 3. Empaquetar y transmitir con hasta 3 intentos */
-        empaquetar_sensores(payload);
-
-        int ret = LORA_ERR_INIT;
-        for (int intento = 1; intento <= 3; intento++) {
-            ret = lorawan_send_uplink(payload, 20, LORAWAN_APP_PORT);
-            if (ret == LORA_OK) {
-                ESP_LOGI(TAG, "Uplink #%lu enviado correctamente (intento %d).",
-                         contador, intento);
-                break;
-            }
-            ESP_LOGW(TAG, "Uplink #%lu fallo (intento %d/3).", contador, intento);
-            if (intento < 3) {
-                vTaskDelay(pdMS_TO_TICKS(15000)); /* esperar 15 s antes de reintentar */
-            }
+        ESP_LOGW(TAG, "Uplink #%lu fallo (intento %d/3).", uplink_contador, intento);
+        if (intento < 3) {
+            vTaskDelay(pdMS_TO_TICKS(15000)); /* esperar 15 s antes de reintentar */
         }
+    }
 
-        /* 4. Si los 3 intentos fallaron, hacer re-join OTAA y reenviar */
-        if (ret != LORA_OK) {
-            ESP_LOGE(TAG, "Uplink #%lu fallo 3 veces. Iniciando re-join OTAA...",
-                     contador);
-            int join_ret;
-            int join_intento = 0;
-            do {
-                join_intento++;
-                join_ret = lorawan_join_otaa();
-                if (join_ret == LORA_OK) {
-                    ESP_LOGI(TAG, "Re-join OTAA exitoso (intento %d).", join_intento);
-                } else {
-                    ESP_LOGW(TAG, "Re-join fallo (intento %d). Reintentando en 15 s...",
-                             join_intento);
-                    vTaskDelay(pdMS_TO_TICKS(15000));
-                }
-            } while (join_ret != LORA_OK);
-
-            /* Reenviar el uplink pendiente tras reconectarse */
-            ESP_LOGI(TAG, "Reenviando uplink #%lu tras reconexion...", contador);
-            ret = lorawan_send_uplink(payload, 20, LORAWAN_APP_PORT);
-            if (ret == LORA_OK) {
-                ESP_LOGI(TAG, "Uplink #%lu reenviado correctamente.", contador);
+    /* 4. Si los 3 intentos fallaron, hacer re-join OTAA y reenviar */
+    if (ret != LORA_OK) {
+        ESP_LOGE(TAG, "Uplink #%lu fallo 3 veces. Iniciando re-join OTAA...",
+                 uplink_contador);
+        int join_ret;
+        int join_intento = 0;
+        do {
+            join_intento++;
+            join_ret = lorawan_join_otaa();
+            if (join_ret == LORA_OK) {
+                ESP_LOGI(TAG, "Re-join OTAA exitoso (intento %d).", join_intento);
             } else {
-                ESP_LOGE(TAG, "Uplink #%lu fallo incluso tras re-join.", contador);
+                ESP_LOGW(TAG, "Re-join fallo (intento %d). Reintentando en 15 s...",
+                         join_intento);
+                vTaskDelay(pdMS_TO_TICKS(15000));
             }
+        } while (join_ret != LORA_OK);
+
+        /* Reenviar el uplink pendiente tras reconectarse */
+        ESP_LOGI(TAG, "Reenviando uplink #%lu tras reconexion...", uplink_contador);
+        ret = lorawan_send_uplink(payload, 20, LORAWAN_APP_PORT);
+        if (ret == LORA_OK) {
+            ESP_LOGI(TAG, "Uplink #%lu reenviado correctamente.", uplink_contador);
+        } else {
+            ESP_LOGE(TAG, "Uplink #%lu fallo incluso tras re-join.", uplink_contador);
         }
     }
 }
@@ -291,6 +321,20 @@ void app_main(void) {
     ESP_LOGI(TAG, " Hardware : Heltec WiFi LoRa 32 V2");
     ESP_LOGI(TAG, " IDF      : %s", esp_get_idf_version());
     ESP_LOGI(TAG, "========================================");
+
+    /* Inicializar GPIO de control de alimentación del sensor ----------------*/
+    gpio_config_t pwr_pin_cfg = {
+        .pin_bit_mask = (1ULL << SENSOR_PWR_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&pwr_pin_cfg));
+    gpio_hold_dis(SENSOR_PWR_PIN);      /* Liberar hold del deep sleep anterior */
+    gpio_set_level(SENSOR_PWR_PIN, 0);  /* Sensor apagado por defecto */
+    ESP_LOGI(TAG, "GPIO%d configurado como control de alimentacion del sensor.",
+             SENSOR_PWR_PIN);
 
     /* Inicializar NVS (requerido para esp_read_mac y RadioLib session store) */
     esp_err_t nvs_ret = nvs_flash_init();
@@ -349,17 +393,17 @@ void app_main(void) {
                  join_intentos);
         vTaskDelay(pdMS_TO_TICKS(15000));
     }
-    ESP_LOGI(TAG, "Conectado a la red LoRaWAN. Iniciando uplinks...");
+    ESP_LOGI(TAG, "Conectado a la red LoRaWAN.");
 
-    /* Lanzar la tarea periodica de uplink */
-    xTaskCreate(
-        tarea_lorawan,
-        "lorawan_uplink",
-        8192,
-        NULL,
-        5,
-        NULL
-    );
+    /* Ejecutar un ciclo de lectura + uplink */
+    uplink_contador++;
+    ejecutar_ciclo_uplink();
 
-    ESP_LOGI(TAG, "Primer uplink en %d s.", LORAWAN_UPLINK_INTERVAL_S);
+    /* Entrar en deep sleep hasta el siguiente ciclo */
+    ESP_LOGI(TAG, "Entrando en deep sleep por %d s (ciclo #%lu)...",
+             LORAWAN_UPLINK_INTERVAL_S, uplink_contador);
+    esp_sleep_enable_timer_wakeup((uint64_t)LORAWAN_UPLINK_INTERVAL_S * 1000000ULL);
+    gpio_set_level(SENSOR_PWR_PIN, 0);  /* Asegurar sensor apagado antes de dormir */
+    gpio_hold_en(SENSOR_PWR_PIN);       /* Mantener GPIO bajo durante deep sleep */
+    esp_deep_sleep_start();
 }
