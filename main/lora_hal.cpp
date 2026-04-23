@@ -19,8 +19,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
-#define LORA_NVS_NAMESPACE  "lora_hal"
-#define LORA_NVS_KEY_NONCES "nonces"
+#define LORA_NVS_NAMESPACE   "lora_hal"
+#define LORA_NVS_KEY_NONCES  "nonces"
+#define LORA_NVS_KEY_SESSION "session"
 
 static const char *TAG = "LORA_HAL";
 
@@ -265,6 +266,25 @@ int lorawan_begin(const uint8_t joinEUI[8], const uint8_t devEUI[8],
         }
     }
 
+    /* Restaurar bufferSession desde NVS (evita re-join tras deep sleep) */
+    {
+        nvs_handle_t h;
+        if (nvs_open(LORA_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+            uint8_t buf[RADIOLIB_LORAWAN_SESSION_BUF_SIZE];
+            size_t  len = sizeof(buf);
+            if (nvs_get_blob(h, LORA_NVS_KEY_SESSION, buf, &len) == ESP_OK &&
+                len == sizeof(buf)) {
+                int16_t rs = lwNode->setBufferSession(buf);
+                if (rs == RADIOLIB_ERR_NONE) {
+                    ESP_LOGI(TAG, "bufferSession restaurado desde NVS — se omitirá el JoinRequest");
+                } else {
+                    ESP_LOGW(TAG, "setBufferSession falló (%d) — se hará join completo", rs);
+                }
+            }
+            nvs_close(h);
+        }
+    }
+
     return LORA_OK;
 }
 
@@ -281,22 +301,27 @@ int lorawan_join_otaa(void) {
 
     if (state == RADIOLIB_LORAWAN_NEW_SESSION) {
         ESP_LOGI(TAG, "Join OTAA exitoso — sesión nueva establecida");
-        /* Guardar bufferNonces en NVS para preservar devNonce */
+        /* Guardar nonces Y sesión en NVS: el próximo ciclo restaurará
+         * la sesión y activateOTAA() retornará SESSION_RESTORED sin
+         * enviar un JoinRequest por el aire. */
         {
             nvs_handle_t h;
             if (nvs_open(LORA_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
                 nvs_set_blob(h, LORA_NVS_KEY_NONCES,
                              lwNode->getBufferNonces(),
                              RADIOLIB_LORAWAN_NONCES_BUF_SIZE);
+                nvs_set_blob(h, LORA_NVS_KEY_SESSION,
+                             lwNode->getBufferSession(),
+                             RADIOLIB_LORAWAN_SESSION_BUF_SIZE);
                 nvs_commit(h);
                 nvs_close(h);
-                ESP_LOGI(TAG, "bufferNonces guardado en NVS");
+                ESP_LOGI(TAG, "bufferNonces + bufferSession guardados en NVS");
             }
         }
         goto join_ok;
     }
     if (state == RADIOLIB_LORAWAN_SESSION_RESTORED) {
-        ESP_LOGI(TAG, "Join OTAA exitoso — sesión restaurada");
+        ESP_LOGI(TAG, "Join OTAA exitoso — sesión restaurada desde NVS (sin JoinRequest)");
         goto join_ok;
     }
 
@@ -352,6 +377,19 @@ int lorawan_send_uplink(const uint8_t *data, size_t length, uint8_t port) {
             ESP_LOGI(TAG, "Uplink OK — downlink recibido en ventana Rx%d", state);
         } else {
             ESP_LOGI(TAG, "Uplink OK — sin downlink");
+        }
+        /* Actualizar bufferSession en NVS para mantener FCnt al día.
+         * Si no se hace, el servidor puede rechazar uplinks tras un reinicio
+         * porque el FCnt en NVS quedaría desactualizado. */
+        {
+            nvs_handle_t h;
+            if (nvs_open(LORA_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_blob(h, LORA_NVS_KEY_SESSION,
+                             lwNode->getBufferSession(),
+                             RADIOLIB_LORAWAN_SESSION_BUF_SIZE);
+                nvs_commit(h);
+                nvs_close(h);
+            }
         }
         return LORA_OK;
     }

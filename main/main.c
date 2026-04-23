@@ -114,6 +114,12 @@ static inline void put_be16(uint8_t *buf, int16_t val) {
     buf[1] = (uint8_t)(val & 0xFF);
 }
 
+/* -- Escribe un uint16 big-endian (para valores siempre positivos) ---------- */
+static inline void put_u16(uint8_t *buf, uint16_t val) {
+    buf[0] = (uint8_t)(val >> 8);
+    buf[1] = (uint8_t)(val & 0xFF);
+}
+
 /* -- Imprime DevEUI / AppEUI / AppKey en consola para registro en Chirpstack */
 static void imprimir_credenciales_lorawan(const uint8_t deveui[8],
                                           const uint8_t joineui[8],
@@ -222,24 +228,24 @@ static void leer_sensor_modbus(void) {
 
 /* -- Empaqueta los valores del sensor en 20 bytes big-endian (payload LoRaWAN)
  *
- *  Bytes  Campo         Tipo    Escala     Unidad
- *  [0:1]  temperatura   int16   x100       grados C
- *  [2:3]  humedad       int16   x100       %
- *  [4:5]  nitrogeno     int16   x100       mg/kg
- *  [6:7]  fosforo       int16   x100       mg/kg
- *  [8:9]  potasio       int16   x100       mg/kg
- *  [10:11]ph            int16   x100       -
- *  [12:13]conductividad int16   x100       uS/cm
- *  [14:19]MAC           bytes   -          direccion MAC base del chip
+ *  Bytes  Campo         Tipo    Escala  Unidad   Razon
+ *  [0:1]  temperatura   int16   x10     grados C sensor entrega 1 decimal (raw/10)
+ *  [2:3]  humedad       int16   x10     %        sensor entrega 1 decimal (raw/10)
+ *  [4:5]  nitrogeno     uint16  x1      mg/kg    sensor entrega entero sin decimales
+ *  [6:7]  fosforo       uint16  x1      mg/kg    sensor entrega entero sin decimales
+ *  [8:9]  potasio       uint16  x1      mg/kg    sensor entrega entero sin decimales
+ *  [10:11]ph            int16   x10     -        sensor entrega 1 decimal (raw/10)
+ *  [12:13]conductividad uint16  x1      uS/cm    sensor entrega entero sin decimales
+ *  [14:19]MAC           bytes   -       -        direccion MAC base del chip
  * --------------------------------------------------------------------------- */
 static void empaquetar_sensores(uint8_t payload[20]) {
-    put_be16(&payload[0],  (int16_t)roundf(lastTemp * 100.0f));
-    put_be16(&payload[2],  (int16_t)roundf(lastHum  * 100.0f));
-    put_be16(&payload[4],  (int16_t)roundf(lastN    * 100.0f));
-    put_be16(&payload[6],  (int16_t)roundf(lastP    * 100.0f));
-    put_be16(&payload[8],  (int16_t)roundf(lastK    * 100.0f));
-    put_be16(&payload[10], (int16_t)roundf(lastPh   * 100.0f));
-    put_be16(&payload[12], (int16_t)roundf(lastEc   * 100.0f));
+    put_be16(&payload[0],  (int16_t) roundf(lastTemp * 10.0f));
+    put_be16(&payload[2],  (int16_t) roundf(lastHum  * 10.0f));
+    put_u16 (&payload[4],  (uint16_t)roundf(lastN));
+    put_u16 (&payload[6],  (uint16_t)roundf(lastP));
+    put_u16 (&payload[8],  (uint16_t)roundf(lastK));
+    put_be16(&payload[10], (int16_t) roundf(lastPh   * 10.0f));
+    put_u16 (&payload[12], (uint16_t)roundf(lastEc));
     esp_read_mac(&payload[14], ESP_MAC_BASE);
 
     ESP_LOGI(TAG, "  T:%.2f C  H:%.2f%%  N:%.2f  P:%.2f  K:%.2f"
@@ -384,14 +390,19 @@ void app_main(void) {
                  esp_err_to_name(mb_ret));
     }
 
-    /* Join OTAA con reintentos indefinidos cada 15 s */
+    /* Join OTAA con backoff exponencial: 15 s → 30 s → 60 s → 120 s (máx)
+     * Evita saturar la red con JoinRequests cuando el servidor no responde. */
     ESP_LOGI(TAG, "Iniciando Join OTAA...");
-    int join_intentos = 0;
-    while (lorawan_join_otaa() != LORA_OK) {
-        join_intentos++;
-        ESP_LOGW(TAG, "Join fallo (intento %d). Reintentando en 15 s...",
-                 join_intentos);
-        vTaskDelay(pdMS_TO_TICKS(15000));
+    {
+        int join_intentos = 0;
+        uint32_t delay_ms = 15000;
+        while (lorawan_join_otaa() != LORA_OK) {
+            join_intentos++;
+            ESP_LOGW(TAG, "Join fallo (intento %d). Reintentando en %lu s...",
+                     join_intentos, (unsigned long)(delay_ms / 1000));
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            if (delay_ms < 120000) delay_ms *= 2; /* backoff: 15→30→60→120 s */
+        }
     }
     ESP_LOGI(TAG, "Conectado a la red LoRaWAN.");
 

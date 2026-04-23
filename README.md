@@ -40,7 +40,7 @@ Despertar (timer RTC) / Encendido inicial
 | Join OTAA + uplink  | ~80–240 mA     |
 | Sensor RS485 activo | ~20–50 mA      |
 
-El consumo promedio depende de `LORAWAN_UPLINK_INTERVAL_S`. Con intervalos de 5 minutos y un ciclo activo de ~10 s, el consumo promedio es inferior a 1 mA, lo que permite alimentar el nodo con baterías pequeñas durante meses.
+El consumo promedio depende de `LORAWAN_UPLINK_INTERVAL_S` (actualmente **1800 s / 30 min**). Con un ciclo activo de ~10–15 s y deep sleep el resto del tiempo, el consumo promedio es inferior a 1 mA, lo que permite alimentar el nodo con baterías pequeñas durante meses.
 
 ### Manejo de GPIO durante Deep Sleep
 
@@ -87,29 +87,30 @@ Esto garantiza que el sensor permanece desconectado durante toda la duración de
 
 ## Formato del Payload LoRaWAN (20 bytes, big-endian)
 
-| Bytes  | Campo         | Tipo  | Escala | Unidad |
-|--------|---------------|-------|--------|--------|
-| 0–1    | Temperatura   | int16 | ×100   | °C     |
-| 2–3    | Humedad       | int16 | ×100   | %      |
-| 4–5    | Nitrógeno     | int16 | ×100   | mg/kg  |
-| 6–7    | Fósforo       | int16 | ×100   | mg/kg  |
-| 8–9    | Potasio       | int16 | ×100   | mg/kg  |
-| 10–11  | pH            | int16 | ×100   | —      |
-| 12–13  | Conductividad | int16 | ×100   | µS/cm  |
-| 14–19  | MAC           | bytes | —      | dirección MAC base del chip |
+| Bytes  | Campo         | Tipo   | Escala | Ejemplo decodificado         | Unidad |
+|--------|---------------|--------|--------|------------------------------|--------|
+| 0–1    | Temperatura   | int16  | ×10    | `0x00F5` → 24.5 °C           | °C     |
+| 2–3    | Humedad       | int16  | ×10    | `0x0258` → 60.0 %            | %      |
+| 4–5    | Nitrógeno     | uint16 | ×1     | `0x0064` → 100 mg/kg         | mg/kg  |
+| 6–7    | Fósforo       | uint16 | ×1     | `0x0032` → 50 mg/kg          | mg/kg  |
+| 8–9    | Potasio       | uint16 | ×1     | `0x00C8` → 200 mg/kg         | mg/kg  |
+| 10–11  | pH            | int16  | ×10    | `0x0049` → 7.3               | —      |
+| 12–13  | Conductividad | uint16 | ×1     | `0x01F4` → 500 µS/cm         | µS/cm  |
+| 14–19  | MAC           | bytes  | —      | dirección MAC base del chip  | —      |
 
 **Ejemplo de decodificación (Python/ChirpStack codec):**
 ```python
 def decode(fport, bytes):
-    def be16(b, i): return int.from_bytes(b[i:i+2], 'big', signed=True) / 100
+    def s16(b, i): return int.from_bytes(b[i:i+2], 'big', signed=True) / 100
+    def u16(b, i): return int.from_bytes(b[i:i+2], 'big', signed=False)
     return {
-        "temperatura":   be16(bytes, 0),
-        "humedad":       be16(bytes, 2),
-        "nitrogeno":     be16(bytes, 4),
-        "fosforo":       be16(bytes, 6),
-        "potasio":       be16(bytes, 8),
-        "ph":            be16(bytes, 10),
-        "conductividad": be16(bytes, 12),
+        "temperatura":   s16(bytes, 0),
+        "humedad":       s16(bytes, 2),
+        "nitrogeno":     u16(bytes, 4)  / 100,
+        "fosforo":       u16(bytes, 6)  / 100,
+        "potasio":       u16(bytes, 8)  / 100,
+        "ph":            s16(bytes, 10),
+        "conductividad": u16(bytes, 12) / 10,   # escala x10, max 6553.5 uS/cm
         "mac": ':'.join(f'{b:02X}' for b in bytes[14:20])
     }
 ```
